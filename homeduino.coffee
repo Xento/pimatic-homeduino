@@ -22,20 +22,23 @@ module.exports = (env) ->
 
       @board = new Board(@config.driver, @config.driverOptions)
 
-      @board.on("data", (data) ->
-        env.logger.debug("data: \"#{data}\"")
+      @board.on("data", (data) =>
+        if @config.debug
+          env.logger.debug("data: \"#{data}\"")
       )
 
-      @board.on("rfReceive", (event) -> 
-        env.logger.debug 'received:', event.pulseLengths, event.pulses
+      @board.on("rfReceive", (event) => 
+        if @config.debug
+          env.logger.debug 'received:', event.pulseLengths, event.pulses
       )
 
-      @board.on("rf", (event) -> 
-        env.logger.debug "#{event.protocol}: ", event.values
+      @board.on("rf", (event) =>  
+        if @config.debug
+          env.logger.debug "#{event.protocol}: ", event.values
       )
 
       @board.on("reconnect", (err) ->
-        env.logger.debug "Couldn't connect (#{err.message}), retrying..."
+        env.logger.warn "Couldn't connect (#{err.message}), retrying..."
       )
 
       @pendingConnect = new Promise( (resolve, reject) =>
@@ -44,7 +47,8 @@ module.exports = (env) ->
             env.logger.info("Connected to homeduino device.")
             if @config.enableReceiving
               @board.rfControlStartReceiving(@config.receiverPin).then( =>
-                env.logger.debug("Receiving on pin #{@config.receiverPin}")
+                if @config.debug
+                  env.logger.debug("Receiving on pin #{@config.receiverPin}")
               ).catch( (err) =>
                 env.logger.error("Couldn't start receiving: #{err.message}.")
                 env.logger.debug(err.stack)
@@ -62,6 +66,7 @@ module.exports = (env) ->
 
       deviceClasses = [
         HomeduinoDHTSensor
+        HomeduinoDSTSensor
         HomeduinoRFSwitch
         HomeduinoRFDimmer
         HomeduinoRFButtonsDevice
@@ -104,7 +109,51 @@ module.exports = (env) ->
 
   hdPlugin = new HomeduinoPlugin()
 
-  # Homed controls FS20 devices
+  class HomeduinoDSTSensor extends env.devices.TemperatureSensor
+
+    constructor: (@config, lastState, @board) ->
+      @id = config.id
+      @name = config.name
+      super()
+
+      lastError = null
+      setInterval(( => 
+        @_readSensor().then( (result) =>
+          lastError = null
+          @emit 'temperature', result.temperature
+        ).catch( (err) =>
+          if lastError is err.message
+            if hdPlugin.config.debug
+              env.logger.debug("Suppressing repeated error message from dht read: #{err.message}")
+            return
+          env.logger.error("Error reading DST Sensor: #{err.message}.")
+          lastError = err.message
+        )
+      ), @config.interval)
+    
+    _readSensor: ()-> 
+      # Already reading? return the reading promise
+      if @_pendingRead? then return @_pendingRead
+      # Don't read the sensor to frequently, the minimal reading interal should be 2.5 seconds
+      if @_lastReadResult?
+        now = new Date().getTime()
+        if (now - @_lastReadTime) < 2000
+          return Promise.resolve @_lastReadResult
+      @_pendingRead = hdPlugin.pendingConnect.then( =>
+        return @board.readDST().then( (result) =>
+          @_lastReadResult = result
+          @_lastReadTime = (new Date()).getTime()
+          @_pendingRead = null
+          return result
+        )
+      ).catch( (err) =>
+        @_pendingRead = null
+        throw err
+      )
+      
+    getTemperature: -> @_readSensor().then( (result) -> result.temperature )
+
+  #Original DHT implementation
   class HomeduinoDHTSensor extends env.devices.TemperatureSensor
 
     attributes:
@@ -131,7 +180,8 @@ module.exports = (env) ->
           @emit 'humidity', result.humidity
         ).catch( (err) =>
           if lastError is err.message
-            env.logger.debug("Suppressing repeated error message from dht read: #{err.message}")
+            if hdPlugin.config.debug
+              env.logger.debug("Suppressing repeated error message from dht read: #{err.message}")
             return
           env.logger.error("Error reading DHT Sensor: #{err.message}.")
           lastError = err.message
@@ -146,7 +196,7 @@ module.exports = (env) ->
         now = new Date().getTime()
         if (now - @_lastReadTime) < 2000
           return Promise.resolve @_lastReadResult
-      @_pendingRead = @board.whenReady().then( =>
+      @_pendingRead = hdPlugin.pendingConnect.then( =>
         return @board.readDHT(@config.type, @config.pin).then( (result) =>
           @_lastReadResult = result
           @_lastReadTime = (new Date()).getTime()
@@ -156,7 +206,10 @@ module.exports = (env) ->
       ).catch( (err) =>
         @_pendingRead = null
         if (err.message is "checksum_error" or err.message is "timeout_error") and attempt < 5
-          env.logger.debug "got #{err.message} while reading dht sensor, retrying: #{attempt} of 5"
+          if hdPlugin.config.debug
+            env.logger.debug(
+              "got #{err.message} while reading dht sensor, retrying: #{attempt} of 5"
+            )
           return Promise.delay(2500).then( => @_readSensor(attempt+1) )
         else
           throw err
@@ -185,7 +238,7 @@ module.exports = (env) ->
           options = _.clone(p.options)
           unless options.all? then options.all = no
           options.state = state if state?
-          pending.push @board.whenReady().then( =>
+          pending.push hdPlugin.pendingConnect.then( =>
             return @board.rfControlSendMessage(
               @_pluginConfig.transmitterPin, 
               p.name, 
@@ -208,7 +261,7 @@ module.exports = (env) ->
             max = _protocol.values.dimlevel.max
             level = Math.round(level / ((100 / (max - min)) + min))
           extend options, {dimlevel: level}
-          pending.push @board.whenReady().then( =>
+          pending.push hdPlugin.pendingConnect.then( =>
             return @board.rfControlSendMessage(
               @_pluginConfig.transmitterPin, 
               p.name, 
